@@ -1,5 +1,6 @@
 import math
 import os
+import re
 
 import torch
 from safetensors import safe_open
@@ -15,13 +16,37 @@ FP4_VALUES = [
 
 # Map the names assumed in this implementation to the checkpoint names.
 PARAM_NAME_MAP = {
-    f"block.{n}.mlp.mlp1_bias": f"block.{n}.mlp.mlp1_bias" for n in range(36)
+    "embedding.weight": "model.embed_tokens.weight",
+    "unembedding.weight": "lm_head.weight",
+    "norm.scale": "model.norm.weight",
 } | {
-    f"block.{n}.mlp.mlp1_weight": (f"block.{n}.mlp.mlp1_weight.blocks", f"block.{n}.mlp.mlp1_weight.scales") for n in range(36)
+    f"block.{n}.attn.norm.scale": f"model.layers.{n}.input_layernorm.weight" for n in range(36)
 } | {
-    f"block.{n}.mlp.mlp2_bias": f"block.{n}.mlp.mlp2_bias" for n in range(36)
+    f"block.{n}.mlp.norm.scale": f"model.layers.{n}.post_attention_layernorm.weight" for n in range(36)
 } | {
-    f"block.{n}.mlp.mlp2_weight": (f"block.{n}.mlp.mlp2_weight.blocks", f"block.{n}.mlp.mlp2_weight.scales") for n in range(36)
+    f"block.{n}.attn.sinks": f"model.layers.{n}.self_attn.sinks" for n in range(36)
+} | {
+    f"block.{n}.attn.out.weight": f"model.layers.{n}.self_attn.o_proj.weight" for n in range(36)
+} | {
+    f"block.{n}.attn.out.bias": f"model.layers.{n}.self_attn.o_proj.bias" for n in range(36)
+} | {
+    f"block.{n}.mlp.gate.weight": f"model.layers.{n}.mlp.router.weight" for n in range(36)
+} | {
+    f"block.{n}.mlp.gate.bias": f"model.layers.{n}.mlp.router.bias" for n in range(36)
+} | {
+    f"block.{n}.mlp.mlp1_bias": f"model.layers.{n}.mlp.experts.gate_up_proj_bias" for n in range(36)
+} | {
+    f"block.{n}.mlp.mlp1_weight": (
+        f"model.layers.{n}.mlp.experts.gate_up_proj_blocks",
+        f"model.layers.{n}.mlp.experts.gate_up_proj_scales",
+    ) for n in range(36)
+} | {
+    f"block.{n}.mlp.mlp2_bias": f"model.layers.{n}.mlp.experts.down_proj_bias" for n in range(36)
+} | {
+    f"block.{n}.mlp.mlp2_weight": (
+        f"model.layers.{n}.mlp.experts.down_proj_blocks",
+        f"model.layers.{n}.mlp.experts.down_proj_scales",
+    ) for n in range(36)
 }
 
 
@@ -50,6 +75,18 @@ class Checkpoint:
         self.tensor_name_to_file = tensor_name_to_file
 
     def get(self, name: str) -> torch.Tensor:
+        if name in self.tensor_name_to_file:
+            return self._get_tensor(name)
+
+        qkv_match = re.match(r"^block\.(\d+)\.attn\.qkv\.(weight|bias)$", name)
+        if qkv_match:
+            layer_idx, kind = qkv_match.groups()
+            base = f"model.layers.{layer_idx}.self_attn"
+            q = self._get_tensor(f"{base}.q_proj.{kind}")
+            k = self._get_tensor(f"{base}.k_proj.{kind}")
+            v = self._get_tensor(f"{base}.v_proj.{kind}")
+            return torch.cat((q, k, v), dim=0)
+
         match PARAM_NAME_MAP.get(name, name):
             case (blocks_name, scales_name):
                 # MoE weights: are in block-based MXFP4 format
@@ -97,6 +134,16 @@ class Checkpoint:
 
         out = torch.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
 
+        scales_flat = scales.reshape(rows_total)
+        try:
+            from gpt_oss.mojo.mxfp4 import try_mxfp4_unpack
+        except Exception:
+            try_mxfp4_unpack = None
+
+        if try_mxfp4_unpack is not None:
+            if try_mxfp4_unpack(out, blocks, scales_flat):
+                return out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
+
         for r0 in range(0, rows_total, rows_per_chunk):
             r1 = min(r0 + rows_per_chunk, rows_total)
 
@@ -135,3 +182,16 @@ class Checkpoint:
         loaded_tensor = torch.ldexp(fp4_values[loaded_blocks.int()], loaded_scales.unsqueeze(-1))
         loaded_tensor = loaded_tensor.view(*loaded_tensor.shape[:-2], -1)
         return loaded_tensor
+
+    def get_mxfp4_blocks_scales(self, blocks_name: str, scales_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if blocks_name not in self.tensor_name_to_file or scales_name not in self.tensor_name_to_file:
+            base = None
+            if blocks_name.endswith(".blocks") and scales_name.endswith(".scales"):
+                base = blocks_name[:-len(".blocks")]
+            if base is not None:
+                mapped = PARAM_NAME_MAP.get(base)
+                if isinstance(mapped, tuple):
+                    blocks_name, scales_name = mapped
+        blocks = self._get_tensor(blocks_name)
+        scales = self._get_tensor(scales_name).to(torch.int32) - 127
+        return blocks, scales

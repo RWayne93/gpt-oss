@@ -15,6 +15,13 @@ def main(args):
             from gpt_oss.torch.model import TokenGenerator as TorchGenerator
             device = init_distributed()
             generator = TorchGenerator(args.checkpoint, device=device)
+        case "mojo":
+            import os
+            os.environ.setdefault("GPT_OSS_MOJO_MXFP4", "1")
+            from gpt_oss.torch.utils import init_distributed
+            from gpt_oss.mojo.model import TokenGenerator as TorchGenerator
+            device = init_distributed()
+            generator = TorchGenerator(args.checkpoint, device=device, context=args.context_length)
         case "triton":
             from gpt_oss.torch.utils import init_distributed
             from gpt_oss.triton.model import TokenGenerator as TritonGenerator
@@ -75,7 +82,7 @@ if __name__ == "__main__":
         metavar="BACKEND",
         type=str,
         default="torch",
-        choices=["triton", "torch", "vllm"],
+        choices=["triton", "torch", "mojo", "vllm"],
         help="Inference backend",
     )
     parser.add_argument(

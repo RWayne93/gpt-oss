@@ -29,6 +29,30 @@ class ModelConfig:
     rope_ntk_beta: float = 32.0
 
 
+def build_model_config(json_config: dict) -> ModelConfig:
+    cfg = dict(json_config)
+    if "num_experts" not in cfg and "num_local_experts" in cfg:
+        cfg["num_experts"] = cfg["num_local_experts"]
+    if "experts_per_token" not in cfg and "num_experts_per_tok" in cfg:
+        cfg["experts_per_token"] = cfg["num_experts_per_tok"]
+    rope_scaling = cfg.get("rope_scaling")
+    if isinstance(rope_scaling, dict):
+        if "rope_scaling_factor" not in cfg and "factor" in rope_scaling:
+            cfg["rope_scaling_factor"] = rope_scaling["factor"]
+        if "rope_ntk_alpha" not in cfg and "beta_slow" in rope_scaling:
+            cfg["rope_ntk_alpha"] = rope_scaling["beta_slow"]
+        if "rope_ntk_beta" not in cfg and "beta_fast" in rope_scaling:
+            cfg["rope_ntk_beta"] = rope_scaling["beta_fast"]
+        if "initial_context_length" not in cfg and "original_max_position_embeddings" in rope_scaling:
+            cfg["initial_context_length"] = rope_scaling["original_max_position_embeddings"]
+    if "initial_context_length" not in cfg and "max_position_embeddings" in cfg:
+        cfg["initial_context_length"] = cfg["max_position_embeddings"]
+
+    allowed = {field.name for field in ModelConfig.__dataclass_fields__.values()}
+    filtered = {k: v for k, v in cfg.items() if k in allowed}
+    return ModelConfig(**filtered)
+
+
 class RMSNorm(torch.nn.Module):
     def __init__(
         self, num_features: int, eps: float = 1e-05, device: torch.device | None = None
@@ -397,7 +421,7 @@ class Transformer(torch.nn.Module):
         config_path = os.path.join(path, "config.json")
         with open(config_path, "r") as f:
             json_config = json.load(f)
-            config = ModelConfig(**json_config)
+            config = build_model_config(json_config)
 
         model = Transformer(
             config=config,
@@ -454,6 +478,8 @@ class TokenGenerator:
                  temperature: float = 1.0,
                  max_tokens: int = 0,
                  return_logprobs: bool = False):
+        if max_tokens is None:
+            max_tokens = 0
         tokens = list(prompt_tokens)
         num_generated_tokens = 0
         while max_tokens == 0 or num_generated_tokens < max_tokens:

@@ -70,6 +70,12 @@ def main(args):
             from gpt_oss.torch.utils import init_distributed
             device = init_distributed()
             generator = TorchGenerator(args.checkpoint, device)
+        case "mojo":
+            os.environ.setdefault("GPT_OSS_MOJO_MXFP4", "1")
+            from gpt_oss.mojo.model import TokenGenerator as TorchGenerator
+            from gpt_oss.torch.utils import init_distributed
+            device = init_distributed()
+            generator = TorchGenerator(args.checkpoint, device, context=args.context)
         case "vllm":
             from gpt_oss.vllm.token_generator import TokenGenerator as VLLMGenerator
             generator = VLLMGenerator(args.checkpoint, tensor_parallel_size=2)
@@ -351,7 +357,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="triton",
-        choices=["triton", "torch", "vllm"],
+        choices=["triton", "torch", "mojo", "vllm"],
         help="Inference backend",
     )
     args = parser.parse_args()
