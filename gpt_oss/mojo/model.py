@@ -6,7 +6,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from gpt_oss.mojo.mxfp4 import try_mxfp4_unpack
+from gpt_oss.mojo.mxfp4 import try_mxfp4_gemm, try_mxfp4_unpack
 from gpt_oss.torch.model import ModelConfig, RMSNorm, build_model_config, swiglu
 from gpt_oss.torch.weights import Checkpoint, FP4_VALUES
 
@@ -14,7 +14,12 @@ _LUT_CACHE: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _UNPACK_BUFFER_CACHE: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _PROFILE = os.environ.get("GPT_OSS_MOJO_PROFILE", "0").strip().lower() in {"1", "true", "yes", "on"}
 _PROFILE_STATS: dict[str, list[float]] = {}
-
+_USE_FUSED_GEMM = os.environ.get("GPT_OSS_MOJO_FUSED_GEMM", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 def _get_int_env(name: str, default: int) -> int:
     value = os.environ.get(name)
@@ -230,7 +235,9 @@ def attention_ref(
         too_old = pos_keys[None, :] < (pos_queries[:, None] - sliding_window + 1)
         mask.masked_fill_(too_old, float("-inf"))
 
-    logits = torch.einsum("bqhmd,bkhmd->bhmqk", query.float(), key.float()) * sm_scale
+    q = query.float().contiguous()
+    k = key.float().contiguous()
+    logits = torch.einsum("bqhmd,bkhmd->bhmqk", q, k) * sm_scale
     logits = logits + mask[None, None, None, :, :]
 
     logits_max = torch.max(logits, dim=-1, keepdim=True).values
@@ -240,7 +247,8 @@ def attention_ref(
     normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + sinks
     scores = unnormalized_scores / normalizer
 
-    output = torch.einsum("bhmqk,bkhmd->bqhmd", scores, value.float())
+    v = value.float().contiguous()
+    output = torch.einsum("bhmqk,bkhmd->bqhmd", scores, v)
 
     output = output.reshape(batch_size, num_queries, num_key_value_heads * num_key_value_groups * head_dim).bfloat16()
     return output
@@ -436,14 +444,39 @@ class MLPBlockMojo(torch.nn.Module):
                 t_chunk = t[start_idx:end_idx]
                 idx_chunk = expert_indices[start_idx:end_idx]
                 weights_chunk = expert_weights[start_idx:end_idx]
+                idx_chunk_i32 = idx_chunk.to(torch.int32) if _USE_FUSED_GEMM else idx_chunk
+                fused_mlp1 = False
+                fused_mlp2 = False
 
                 if _PROFILE:
                     _sync(x.device)
                     start = time.perf_counter()
-                mlp1_weight = self._unpack_selected(self.mlp1_blocks, self.mlp1_scales, idx_chunk)
-                mlp1_bias = self.mlp1_bias[idx_chunk, ...]
-                t_chunk = torch.einsum("beck,bk->bec", mlp1_weight, t_chunk) + mlp1_bias
-                t_chunk = swiglu(t_chunk, limit=self.swiglu_limit)
+                if _USE_FUSED_GEMM:
+                    x_expanded = t_chunk[:, None, :].expand(
+                        -1, idx_chunk_i32.shape[1], -1
+                    ).contiguous()
+                    mlp1_out = torch.empty(
+                        (x_expanded.shape[0], x_expanded.shape[1], self.mlp1_bias.shape[1]),
+                        device=x_expanded.device,
+                        dtype=torch.bfloat16,
+                    )
+                    if try_mxfp4_gemm(
+                        mlp1_out,
+                        x_expanded,
+                        self.mlp1_blocks,
+                        self.mlp1_scales,
+                        idx_chunk_i32,
+                        self.mlp1_bias,
+                    ):
+                        t_chunk = swiglu(mlp1_out, limit=self.swiglu_limit)
+                        fused_mlp1 = True
+                if not fused_mlp1:
+                    mlp1_weight = self._unpack_selected(
+                        self.mlp1_blocks, self.mlp1_scales, idx_chunk
+                    )
+                    mlp1_bias = self.mlp1_bias[idx_chunk, ...]
+                    t_chunk = torch.einsum("beck,bk->bec", mlp1_weight, t_chunk) + mlp1_bias
+                    t_chunk = swiglu(t_chunk, limit=self.swiglu_limit)
                 if _PROFILE:
                     _sync(x.device)
                     _profile_add("mlp_mlp1", time.perf_counter() - start)
@@ -451,10 +484,29 @@ class MLPBlockMojo(torch.nn.Module):
                 if _PROFILE:
                     _sync(x.device)
                     start = time.perf_counter()
-                mlp2_weight = self._unpack_selected(self.mlp2_blocks, self.mlp2_scales, idx_chunk)
-                mlp2_bias = self.mlp2_bias[idx_chunk, ...]
-                t_chunk = torch.einsum("beck,bek->bec", mlp2_weight, t_chunk)
-                t_chunk += mlp2_bias
+                if _USE_FUSED_GEMM:
+                    mlp2_out = torch.empty(
+                        (t_chunk.shape[0], t_chunk.shape[1], self.mlp2_bias.shape[1]),
+                        device=t_chunk.device,
+                        dtype=torch.bfloat16,
+                    )
+                    if try_mxfp4_gemm(
+                        mlp2_out,
+                        t_chunk.contiguous(),
+                        self.mlp2_blocks,
+                        self.mlp2_scales,
+                        idx_chunk_i32,
+                        self.mlp2_bias,
+                    ):
+                        t_chunk = mlp2_out
+                        fused_mlp2 = True
+                if not fused_mlp2:
+                    mlp2_weight = self._unpack_selected(
+                        self.mlp2_blocks, self.mlp2_scales, idx_chunk
+                    )
+                    mlp2_bias = self.mlp2_bias[idx_chunk, ...]
+                    t_chunk = torch.einsum("beck,bek->bec", mlp2_weight, t_chunk)
+                    t_chunk += mlp2_bias
                 if _PROFILE:
                     _sync(x.device)
                     _profile_add("mlp_mlp2", time.perf_counter() - start)
@@ -472,10 +524,37 @@ class MLPBlockMojo(torch.nn.Module):
             if _PROFILE:
                 _sync(x.device)
                 start = time.perf_counter()
-            mlp1_weight = self._unpack_selected(self.mlp1_blocks, self.mlp1_scales, expert_indices)
-            mlp1_bias = self.mlp1_bias[expert_indices, ...]
-            t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-            t = swiglu(t, limit=self.swiglu_limit)
+            expert_indices_i32 = (
+                expert_indices.to(torch.int32) if _USE_FUSED_GEMM else expert_indices
+            )
+            fused_mlp1 = False
+            fused_mlp2 = False
+            if _USE_FUSED_GEMM:
+                x_expanded = t[:, None, :].expand(
+                    -1, expert_indices_i32.shape[1], -1
+                ).contiguous()
+                mlp1_out = torch.empty(
+                    (x_expanded.shape[0], x_expanded.shape[1], self.mlp1_bias.shape[1]),
+                    device=x_expanded.device,
+                    dtype=torch.bfloat16,
+                )
+                if try_mxfp4_gemm(
+                    mlp1_out,
+                    x_expanded,
+                    self.mlp1_blocks,
+                    self.mlp1_scales,
+                    expert_indices_i32,
+                    self.mlp1_bias,
+                ):
+                    t = swiglu(mlp1_out, limit=self.swiglu_limit)
+                    fused_mlp1 = True
+            if not fused_mlp1:
+                mlp1_weight = self._unpack_selected(
+                    self.mlp1_blocks, self.mlp1_scales, expert_indices
+                )
+                mlp1_bias = self.mlp1_bias[expert_indices, ...]
+                t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
+                t = swiglu(t, limit=self.swiglu_limit)
             if _PROFILE:
                 _sync(x.device)
                 _profile_add("mlp_mlp1", time.perf_counter() - start)
@@ -483,10 +562,29 @@ class MLPBlockMojo(torch.nn.Module):
             if _PROFILE:
                 _sync(x.device)
                 start = time.perf_counter()
-            mlp2_weight = self._unpack_selected(self.mlp2_blocks, self.mlp2_scales, expert_indices)
-            mlp2_bias = self.mlp2_bias[expert_indices, ...]
-            t = torch.einsum("beck,bek->bec", mlp2_weight, t)
-            t += mlp2_bias
+            if _USE_FUSED_GEMM:
+                mlp2_out = torch.empty(
+                    (t.shape[0], t.shape[1], self.mlp2_bias.shape[1]),
+                    device=t.device,
+                    dtype=torch.bfloat16,
+                )
+                if try_mxfp4_gemm(
+                    mlp2_out,
+                    t.contiguous(),
+                    self.mlp2_blocks,
+                    self.mlp2_scales,
+                    expert_indices_i32,
+                    self.mlp2_bias,
+                ):
+                    t = mlp2_out
+                    fused_mlp2 = True
+            if not fused_mlp2:
+                mlp2_weight = self._unpack_selected(
+                    self.mlp2_blocks, self.mlp2_scales, expert_indices
+                )
+                mlp2_bias = self.mlp2_bias[expert_indices, ...]
+                t = torch.einsum("beck,bek->bec", mlp2_weight, t)
+                t += mlp2_bias
             if _PROFILE:
                 _sync(x.device)
                 _profile_add("mlp_mlp2", time.perf_counter() - start)

@@ -12,6 +12,8 @@ _OPS_LOAD_ERROR: Optional[Exception] = None
 _OPS_LOGGED = False
 
 _LOG = logging.getLogger("gpt_oss.mojo.mxfp4")
+_FUSED_GEMM_ACC = os.environ.get("GPT_OSS_MOJO_FUSED_GEMM_ACC", "fp32").strip().lower()
+_FUSED_GEMM_IMPL = os.environ.get("GPT_OSS_MOJO_FUSED_GEMM_IMPL", "naive").strip().lower()
 
 
 def _truthy(value: str) -> bool:
@@ -35,6 +37,22 @@ def _log_once(message: str, level: str = "info") -> None:
         return
     _OPS_LOGGED = True
     getattr(_LOG, level, _LOG.info)(message)
+
+
+def _get_op(ops, name: str):
+    try:
+        return getattr(ops, name)
+    except Exception:
+        # Avoid torch.compiler.disable (and its triton dependency) if it is broken.
+        try:
+            from max.torch.torch import CustomOp  # type: ignore
+        except Exception:
+            raise
+        op = ops._ops.get(name)
+        if op is None:
+            op = CustomOp(ops, name)
+            ops._ops[name] = op
+        return op
 
 
 def _resolve_ops_path() -> Path:
@@ -83,10 +101,50 @@ def try_mxfp4_unpack(
         _log_once("Mojo MXFP4 op unavailable; falling back to torch", "warning")
         return False
     try:
-        ops.mxfp4_unpack(out, blocks, scales)
+        _get_op(ops, "mxfp4_unpack")(out, blocks, scales)
     except Exception:  # pragma: no cover - runtime fallback
         if _should_strict():
             raise
         _log_once("Mojo MXFP4 op failed at runtime; falling back to torch", "warning")
+        return False
+    return True
+
+def try_mxfp4_gemm(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+    expert_idx: torch.Tensor,
+    bias: torch.Tensor,
+) -> bool:
+    if not _should_use_mojo():
+        return False
+    ops = _load_ops()
+    if ops is None:
+        if _should_strict():
+            raise RuntimeError(f"Mojo MXFP4 op failed to load: {_OPS_LOAD_ERROR!r}")
+        _log_once("Mojo MXFP4 op unavailable; falling back to torch", "warning")
+        return False
+    try:
+        use_bf16_acc = _FUSED_GEMM_ACC in {"bf16", "bfloat16"}
+        if _FUSED_GEMM_IMPL in {"warp", "warp-tiled", "warp_tiled"}:
+            op_name = "mxfp4_gemm_warp_bf16acc" if use_bf16_acc else "mxfp4_gemm_warp"
+        elif _FUSED_GEMM_IMPL in {"tiled", "tile"}:
+            op_name = "mxfp4_gemm_tiled_bf16acc" if use_bf16_acc else "mxfp4_gemm_tiled"
+        else:
+            op_name = "mxfp4_gemm_bf16acc" if use_bf16_acc else "mxfp4_gemm"
+        op = _get_op(ops, op_name)
+        op(
+            out.detach(),
+            x.detach(),
+            blocks.detach(),
+            scales.detach(),
+            expert_idx.detach(),
+            bias.detach(),
+        )
+    except Exception:  # pragma: no cover - runtime fallback
+        if _should_strict():
+            raise
+        _log_once("Mojo MXFP4 gemm failed at runtime; falling back to torch", "warning")
         return False
     return True
